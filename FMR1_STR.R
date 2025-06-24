@@ -2,6 +2,283 @@
 
 
 
+############### STEP 1 #########################################################
+
+#### extracting repeat length from VCF files using python and reading in 
+#### the phenotypes of interest from the RAP
+
+import os
+import gzip
+import dxpy
+import multiprocessing
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+from glob import glob
+
+
+pip install numpy==1.25.2 --no-cache-dir
+pip install --no-cache-dir --force-reinstall scipy
+pip install --no-cache-dir --force-reinstall dxdata
+pip install tables --no-cache-dir
+
+finaltypes = {'chr': str,
+  'refstart': int,
+  'refend': int,
+  'refcount': int,
+  'reflength': int,
+  'repeatunit': str,
+  'allele1': float,
+  'allele2':float,
+  'eid': int}
+
+
+def find_headerline(path):
+  with gzip.open(path, 'r') as file:
+  for idx, line in enumerate(file, start=0):
+  if line.startswith(b'#CHROM'):
+  return idx
+
+def parse_vcfinfo(info: pd.Series):
+  varinfo = info.str.split(';', expand=True)[[0,1,2,3,4]]
+varinfo = varinfo.apply(lambda x: x.str.split('=', expand=True)[1], axis=0)
+return varinfo.rename(columns={0:'refend',1:'refcount',2:'reflength',3:'repeatunit',4:'varid'})
+
+def generate_alleles(vcfsample: pd.Series):
+  genotype = vcfsample.str.split(':', expand=True)[2]
+alleles = genotype.str.split('/', expand=True)
+return alleles.rename(columns={0: 'allele1', 1: 'allele2'})
+
+def generate_allele_models(alleles: pd.Series, varinfo: pd.Series):
+  out = pd.DataFrame()
+out['totalcount'] = alleles['allele1'] + alleles['allele2']
+out['maxcount'] = alleles[['allele1','allele2']].max(axis=1)
+out['totalratio'] = out['totalcount'] / (2 * varinfo['refcount'])
+
+
+
+def parse_vcf_to_tabular(eid, path):
+  data = pd.read_csv(path, sep='\t', header=find_headerline(path))
+os.remove(path)
+data.rename(columns={'#CHROM':'chr', 'POS':'refstart'}, inplace=True)
+
+varinfo = parse_vcfinfo(data['INFO'])
+alleles = generate_alleles(data[data.columns[-1]])
+
+out = data[['chr','refstart']].join(varinfo).join(alleles)
+out.replace('.', np.nan, inplace=True)
+out['eid'] = eid
+autosomal = out[out['chr']!='chrX'].dropna(how='any')
+xchrom = out[out['chr']=='chrX']########################
+return pd.concat([autosomal, xchrom]).astype(finaltypes).set_index('varid', drop=True)
+
+
+
+def get_vcflist(vcflist):
+  with open(vcflist, 'r') as file:
+  return [x.strip('\n') for x in file.readlines()]
+
+def initiate_vcffile(dxid):
+  eid = dxpy.DXFile(dxid).name.split('_')[0]
+localname = f"{eid}_calls.vcf.gz"
+# Download to instance, overwrite last copy and verify that change
+dxpy.download_dxfile(dxid, localname)
+return eid, localname
+
+
+def initiate_vcf_and_parse(dxid):
+  eid, localname = initiate_vcffile(dxid)
+return parse_vcf_to_tabular(eid, localname)
+
+def process_vcflist(path: str):
+  vcflist = get_vcflist(path)
+proc = multiprocessing.cpu_count()
+print(f'Available CPUs for pool: {proc}')
+with multiprocessing.Pool(proc) as pool:
+  return list(tqdm(pool.imap(initiate_vcf_and_parse, vcflist), total=len(vcflist)))
+
+
+def store_to_hdf(results, eidblock):
+  hdfpath = f'strcalls_clinsubset_dragen_male_eid{eidblock}.hdf'
+
+if os.path.exists(hdfpath):
+  os.remove(hdfpath)
+
+with pd.HDFStore(hdfpath, 'w') as store:
+  for x in tqdm(results):
+  store.put(f'eids_{eidblock}_prefix', x, 
+            format='table', append=True, 
+            data_columns=['eid'], 
+            complib='blosc', 
+            complevel=9)
+return hdfpath
+
+
+for i in range(50,61):
+  results = process_vcflist(f'/mnt/project/resources/strcalls/dragen_exphunter_vcflists/male/strcalls_dragen_vcflist_male_eid{i}.txt')
+localhdf = store_to_hdf(results, i)
+#dxpy.upload_local_file(localhdf)
+
+
+
+def store_to_hdf(results, eidblock):
+  # Define the path for the HDF file (you can add a local directory like /tmp/ if needed)
+  hdfpath = f'strcalls_clinsubset_dragen_female_eid{eidblock}.hdf'
+
+# If the file exists, remove it
+if os.path.exists(hdfpath):
+  os.remove(hdfpath)
+
+# Open the HDFStore and write the data
+with pd.HDFStore(hdfpath, 'w') as store:
+  for x in tqdm(results):
+  store.put(f'eids_{eidblock}_prefix', x, 
+            format='table', append=True, 
+            data_columns=['eid'], 
+            complib='blosc', 
+            complevel=5)
+
+return hdfpath
+
+
+for i in range(11,12):
+  results = process_vcflist(f'/mnt/project/resources/strcalls/dragen_exphunter_vcflists/female/strcalls_dragen_vcflist_female_eid{i}.txt')
+localhdf = store_to_hdf(results, i)
+#dxpy.upload_local_file(localhdf)
+
+
+import dxpy
+import os
+from glob import glob
+import pandas as pd
+import numpy as np
+import tables
+
+
+
+# Load up FMR1 STR genotypes from processed HDFs (must already be dx downloaded to location shown)
+# fmr1 dataframe produced shows a1 and a2 repeat counts, NOT base counts (if it were base counts, they'd need to be a multiple of 3)
+frames = list()
+for x in glob(f'/mnt/project/resources/strcalls/dragen_exphunter_hdfs_male/*.hdf'):
+  with pd.HDFStore(x, 'r') as store:
+  i = os.path.splitext(os.path.basename(x))[0].split('_')[4].lstrip('eid')
+subframe = store.select(f"eids_{i}_prefix", 
+                        where='index=FMR1', 
+                        columns=['eid','allele1','allele2','refcount'])
+frames.append(subframe)
+fmr1_male = pd.concat(frames).set_index('eid', drop=True)
+
+
+data=fmr1_male
+
+
+data.to_csv('fmr1_male.txt', sep='\t', index=True)
+
+
+
+#### extracting the relevant phenotypes 
+
+
+# Pull in ovarian ageing phenotypes from group projects and own covariates
+thisproj = 'project-GgB82BQJK6Y3469x45fkP727'
+phensandbox = 'project-G7G4YgjJYVkPQ93jPpFY2pxg'
+dxpy.download_folder(thisproj, 'dragen_exphunter_hdfs', '/resources/strcalls/dragen_exphunter_hdfs')
+dxpy.download_dxfile("file-G82b4xjJYVk24bfJ47QP4F87", 'anm.txt', project = phensandbox)
+dxpy.download_dxfile("file-G7p0kZ0JYVk89zK628525Vkp", 'aam.txt', project = phensandbox)
+dxpy.download_dxfile("file-G82b58QJYVkJb1J03Bq2Xpj3", 'poi.txt', project = phensandbox)
+dxpy.download_dxfile("file-Gjgp1X0JX6GPxG7Jvkb762k7", 'births.txt')
+dxpy.download_dxfile("file-GkZ6yGQJ7vyX57JpJjY7Fj8J", 'covars.txt')
+
+
+
+# Read in group phenotypes and index on EID
+anm = pd.read_csv('anm.txt', delim_whitespace=True, usecols=['IID','nat_mage_min34']).set_index('IID', drop=True)
+aam = pd.read_csv('aam.txt', delim_whitespace=True, usecols=['IID','AAM_all']).set_index('IID', drop=True)
+poi = pd.read_csv('poi.txt', delim_whitespace=True, usecols=['IID','nat_mage_POI']).set_index('IID', drop=True)
+
+# Derive early and late menarche categorical
+aam['relative_aam'] = pd.cut(aam['AAM_all'], [0,11,15,27], right=False, labels=['early','normal','late'])
+
+
+# Read in and process covars, index on EID
+covars = pd.read_csv('covars.txt', sep='\t').set_index('eid', drop=True)
+covars.rename(columns={'p22001': 'sex', 
+  'p21022': 'age', 
+  'p22006': 'eur', 
+  'p22021': 'kinship',
+  'p32060': 'coverage',
+  'p32051': 'seqprovider',
+  'p22000': 'arraybatch'}, inplace=True)
+
+
+
+# Read in birth phenotypes and get derived phenotypes, index on EID
+births = pd.read_csv('births.txt', sep='\t').set_index('eid', drop=True)
+births['live_births'] = births[['p2734_i0','p2734_i1','p2734_i2','p2734_i3']].max(axis=1)
+births['no_children'] = pd.cut(births['live_births'], [0,1,23], right=False, labels=['No children','At least one child'])
+births['miscarriages'] = births[['p3839_i0','p3839_i1','p3839_i2','p3839_i3']].max(axis=1)
+births['stillbirths'] = births[['p3829_i0','p3829_i1','p3829_i2','p3829_i3']].max(axis=1)
+births['lost_pregnancy'] = np.where(((births['miscarriages']>0) | (births['stillbirths']>0)),1, np.NaN)
+births['lost_pregnancy'] = np.where(((births['miscarriages']==0) & (births['stillbirths']==0)), 0, births['lost_pregnancy'])
+births = births[['live_births','no_children','lost_pregnancy','miscarriages','stillbirths']]
+
+
+
+# Load up FMR1 STR genotypes from processed HDFs (must already be dx downloaded to location shown)
+# fmr1 dataframe produced shows a1 and a2 repeat counts, NOT base counts (if it were base counts, they'd need to be a multiple of 3)
+frames = list()
+for x in glob('dragen_exphunter_hdfs/*.hdf'):
+  with pd.HDFStore(x, 'r') as store:
+  i = os.path.splitext(os.path.basename(x))[0].split('_')[4].lstrip('eid')
+subframe = store.select(f"eids_{i}_prefix", 
+                        where='index=FMR1', 
+                        columns=['eid','allele1','allele2','refcount'])
+frames.append(subframe)
+fmr1 = pd.concat(frames).set_index('eid', drop=True)
+
+
+# There is one person with a full mutation - omit them 
+fmr1 = fmr1[((fmr1['allele1']<200) & (fmr1['allele2']<200))]
+
+
+# Create derived allele exposures
+fmr1['allele_sum'] = fmr1['allele1'] + fmr1['allele2']
+fmr1['max_allele'] = fmr1[['allele1','allele2']].max(axis=1)
+premut1 = np.where(fmr1['allele1'].between(55,200), 1, 0)
+premut2 = np.where(fmr1['allele2'].between(55,200), 1, 0)
+fmr1['has_premut'] = np.where(((premut1==1) | (premut2==1)), 1, 0)
+highrisk1 = np.where(fmr1['allele1'].between(70,100), 1, 0)
+highrisk2 = np.where(fmr1['allele2'].between(70,100), 1, 0)
+fmr1['has_highrisk'] = np.where(((highrisk1==1) | (highrisk2==1)), 1, 0)
+
+
+
+data = fmr1.join([covars, anm, aam, poi, births], how='inner', validate='1:1')
+data.index.name = 'IID'
+assert all(data['sex']==0)
+
+
+data.to_csv('fmr1_main_analytic.txt', sep='\t', index=True)
+
+
+dxpy.upload_local_file('fmr1_main_analytic.txt', folder='/fmr1')
+
+
+
+
+
+
+
+
+
+
+
+
+####### STEP 2 #################################################################
+
+
+### phenotypic analysis with extracted repeat length in R
+
 library(stringr)  
 library(dplyr)   
 library(tidyr)    
